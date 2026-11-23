@@ -89,8 +89,17 @@ final class SpeakEngine {
     var onLatency: ((Double) -> Void)?
     /// Set by the sound test: the next press is a rehearsal. It reports every stage here and stays
     /// out of the meeting record and the diagnostics.
-    var probe: SpeakProbe?
+    var activeProbe: SpeakProbe? { probe }
+    func prepareProbe(_ p: SpeakProbe?) {
+        probe = p
+    }
     private var releasedAt: Date?
+    private var pressGeneration = 0
+    private var releaseTask: Task<Void, Never>?
+    private var work: Task<Void, Never>?
+    private var speechGeneration = 0
+    private var playbackDone: (() -> Void)?
+    private var probe: SpeakProbe?
     /// When the latest `speak` call started sending audio, and how it was voiced.
     private(set) var firstAudioAt: Date?
     private(set) var lastVoice = ""
@@ -106,6 +115,10 @@ final class SpeakEngine {
     private let micQueue = DispatchQueue(label: "com.wquguru.cicada.mic", qos: .userInitiated)
     private let converter = PCMConverter()
     private var analyzerFormat: AVAudioFormat?
+    var preparedFormat: AVAudioFormat? {
+        get { analyzerFormat }
+        set { analyzerFormat = newValue }
+    }
     private var analyzerLocale = ""
     private nonisolated(unsafe) var feeding = false
     private var finals: [String] = []
@@ -177,8 +190,11 @@ final class SpeakEngine {
     }
 
     func teardownAnalyzer() async {
+        pressCancelled()
         utterance?.input.finish()
         utterance = nil
+        await analyzer?.cancelAndFinishNow()
+        analyzer = nil
         analyzerFormat = nil
         analyzerLocale = ""
     }
@@ -186,9 +202,23 @@ final class SpeakEngine {
     /// One press = one analyzer over a finite stream. Finishing the stream and
     /// awaiting `finalizeAndFinishThroughEndOfInput` guarantees every word
     /// spoken during the press is in the result before we translate it.
-    private var utterance: (input: AsyncStream<AnalyzerInput>.Continuation, text: Task<String, Never>)?
+    struct PressUtterance {
+        let id: Int
+        let input: AsyncStream<AnalyzerInput>.Continuation
+        let text: Task<String, Never>
+    }
+    /// Test isolation for SpeechAnalyzer and AVAudioEngine; production leaves both nil.
+    var makeUtterance: ((Int) -> PressUtterance?)?
+    var startCapture: ((AVAudioFormat, AsyncStream<AnalyzerInput>.Continuation, Int) throws -> Void)?
+    var releaseDelayNanoseconds: UInt64 = 250_000_000
+    private var utterance: PressUtterance?
+    private var analyzer: SpeechAnalyzer?
 
-    private func beginUtterance() -> AsyncStream<AnalyzerInput>.Continuation? {
+    private func beginUtterance(id: Int) -> PressUtterance? {
+        if let made = makeUtterance?(id) {
+            utterance = made
+            return made
+        }
         guard analyzerFormat != nil else { return nil }
         let lang = settings.speakFromLang
         // Without `.fastResults` Chinese only reports every ~11 s of audio, so the bar stays
@@ -202,12 +232,13 @@ final class SpeakEngine {
         let task = Task { [weak self] () -> String in
             let collector = Task { [weak self] in
                 do {
-                    for try await r in t.results { self?.handle(r) }
+                    for try await r in t.results { self?.handle(r, id: id) }
                 } catch {
                     debugLog("speak recognition error: \(error)")
                 }
             }
             let analyzer = SpeechAnalyzer(inputSequence: stream, modules: [t])
+            await MainActor.run { self?.analyzer = analyzer }
             do {
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
@@ -216,11 +247,12 @@ final class SpeakEngine {
             await collector.value
             return self?.currentText ?? ""
         }
-        utterance = (cont, task)
-        return cont
+        utterance = PressUtterance(id: id, input: cont, text: task)
+        return utterance
     }
 
-    private func handle(_ r: SpeechTranscriber.Result) {
+    private func handle(_ r: SpeechTranscriber.Result, id: Int) {
+        guard id == pressGeneration else { return }
         let text = String(r.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
         if r.isFinal {
             if !text.isEmpty { finals.append(text) }
@@ -240,39 +272,60 @@ final class SpeakEngine {
 
     func pressBegan() {
         guard settings.speakEnabled || probe != nil, phase == .idle || phase == .speaking else { return }
-        guard let format = analyzerFormat, let input = beginUtterance() else {
+        guard let format = analyzerFormat else {
             Task { await prepare() }
             onStatus?(L("语音识别仍在准备中，请再按一次"))
             return
         }
+        if phase == .speaking { pressCancelled() }
+        pressGeneration += 1
+        guard let u = beginUtterance(id: pressGeneration) else { return }
         debugLog("speak: press began")
         pressStarted = Date()
         phase = .listening
         onLive?(.listening, "", "")
-        startMic(format: format, input: input)
+        startMic(format: format, input: u.input, id: pressGeneration)
     }
 
-    /// The talk key turned out to be part of a chord: drop what was heard, send nothing.
+    /// The talk key turned out to be part of a chord, or its rehearsal closed: drop what was heard,
+    /// cancel the whole chain, and send nothing. All late work belongs to the old press generation.
     func pressCancelled() {
-        guard phase == .listening else { return }
+        guard phase != .idle || releaseTask != nil || work != nil else { return }
+        pressGeneration += 1
+        releaseTask?.cancel()
+        releaseTask = nil
+        work?.cancel()
+        work = nil
         stopMic()
         utterance?.input.finish()
         utterance = nil
+        let analyzer = self.analyzer
+        self.analyzer = nil
+        Task { await analyzer?.cancelAndFinishNow() }
+        resetOutput()
         micQueue.sync { pressSamples = [] }
         finals = []
         volatile = ""
+        releasedAt = nil
+        probe?.finish()
+        probe = nil
         phase = .idle
         onLive?(.idle, "", "")
-        debugLog("speak: press cancelled (chord)")
+        debugLog("speak: press cancelled")
     }
 
     func pressEnded() {
         guard phase == .listening else { return }
         debugLog("speak: press ended")
         releasedAt = Date()
-        // Keep the mic open a moment so the last syllable isn't cut off.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            MainActor.assumeIsolated { self?.finishUtterance() }
+        let id = pressGeneration
+        // Keep the mic open a moment so the last syllable isn't cut off. The task must be
+        // cancellable: after a chord, this delayed release must not start translating.
+        releaseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: self?.releaseDelayNanoseconds ?? 250_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.releaseTask = nil
+            self.finishUtterance(id: id)
         }
     }
 
@@ -296,34 +349,58 @@ final class SpeakEngine {
     /// Returns false when the engine isn't ready.
     @discardableResult
     func speakBuffers(_ buffers: [AVAudioPCMBuffer]) async -> Bool {
-        guard phase == .idle || phase == .speaking, let format = analyzerFormat, let input = beginUtterance() else {
+        guard phase == .idle || phase == .speaking, let format = analyzerFormat else {
             debugLog("speakBuffers: not ready")
             return false
         }
+        if phase == .speaking { pressCancelled() }
+        pressGeneration += 1
+        let id = pressGeneration
+        guard let input = beginUtterance(id: id)?.input else { return false }
         pressStarted = Date()
         phase = .listening
         onLive?(.listening, "", "")
         let conv = PCMConverter()
         for buf in buffers {
+            guard !Task.isCancelled, id == pressGeneration else {
+                pressCancelled()
+                return false
+            }
             if let c = conv.convert(buf, to: format) {
                 input.yield(AnalyzerInput(buffer: c))
                 micQueue.sync { keepForMing(c) }
             }
             let seconds = Double(buf.frameLength) / buf.format.sampleRate
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            } catch {
+                pressCancelled()
+                return false
+            }
         }
         releasedAt = Date()
-        finishUtterance()
-        return true
+        finishUtterance(id: id)
+        await work?.value
+        return id == pressGeneration
     }
 
-    private func startMic(format: AVAudioFormat, input cont: AsyncStream<AnalyzerInput>.Continuation) {
+    private func startMic(format: AVAudioFormat, input cont: AsyncStream<AnalyzerInput>.Continuation, id: Int) {
+        if let startCapture {
+            do {
+                try startCapture(format, cont, id)
+            } catch {
+                debugLog("mic start failed: \(error)")
+                onStatus?(L("麦克风无法启动，请在系统设置里允许\(appDisplayName)使用麦克风"))
+                micFailed(id: id)
+            }
+            return
+        }
         let inputNode = mic.inputNode
         AudioDevices.pinInput(mic, to: inputDevice?())
         let inFormat = inputNode.outputFormat(forBus: 0)
         guard inFormat.sampleRate > 0 else {
             onStatus?(L("没有可用的麦克风"))
-            phase = .idle
+            micFailed(id: id)
             return
         }
         inputNode.removeTap(onBus: 0)
@@ -345,8 +422,19 @@ final class SpeakEngine {
         } catch {
             debugLog("mic start failed: \(error)")
             onStatus?(L("麦克风无法启动，请在系统设置里允许\(appDisplayName)使用麦克风"))
-            phase = .idle
+            micFailed(id: id)
         }
+    }
+
+    private func micFailed(id: Int) {
+        guard id == pressGeneration else { return }
+        stopMic()
+        utterance?.input.finish()
+        utterance = nil
+        Task { await analyzer?.cancelAndFinishNow() }
+        analyzer = nil
+        phase = .idle
+        onLive?(.idle, "", "")
     }
 
     private nonisolated func keepForMing(_ buffer: AVAudioPCMBuffer) {
@@ -389,17 +477,19 @@ final class SpeakEngine {
         }
     }
 
-    private func finishUtterance() {
+    private func finishUtterance(id: Int) {
+        guard id == pressGeneration, phase == .listening else { return }
         stopMic()
         phase = .translating
         let probe = self.probe
         self.probe = nil
-        guard let u = utterance else { phase = .idle; probe?.finish(); return }
+        guard let u = utterance, u.id == id else { phase = .idle; probe?.finish(); return }
         utterance = nil
         u.input.finish()
         let released = releasedAt ?? Date()
         releasedAt = nil
         let wav = takePressWAV()
+        let started = pressStarted
         probe?.released = released
         probe?.pressWAV = wav
         let from = settings.speakFromLang.code
@@ -410,32 +500,42 @@ final class SpeakEngine {
             guard let wav, let interpret else { return nil }
             return await interpret(wav, from, to, trace)
         }
-        Task {
+        work = Task { @MainActor [weak self] in
+            guard let self else { ming.cancel(); return }
+            defer {
+                ming.cancel()
+                if id == self.pressGeneration {
+                    self.phase = .idle
+                    self.work = nil
+                }
+                probe?.finish()
+            }
             var text = await u.text.value
-            finals = []
-            volatile = ""
-            if !text.isEmpty { onLive?(.translating, text, "") }
+            guard self.current(id: id) else { return }
+            self.finals = []
+            self.volatile = ""
+            if !text.isEmpty { self.onLive?(.translating, text, "") }
             let heard = await ming.value
+            guard self.current(id: id) else { return }
             if let heard { text = heard.original }
             // Ming answers recognition and translation together: its whole call counts as `recognize`.
             let textAt = Date()
             probe?.text = text
             probe?.textAt = textAt
             guard !text.isEmpty else {
-                phase = .idle
-                onLive?(.idle, "", "")
-                probe?.finish()
+                self.onLive?(.idle, "", "")
                 return
             }
-            onLive?(.translating, text, "")
+            self.onLive?(.translating, text, "")
             // Never speak the untranslated original into the room: if translation
             // fails, say so on the bar and send nothing.
             let result: String?
             if let heard {
                 result = heard.translation
             } else {
-                result = await translate?(text, from, to, trace)
+                result = await self.translate?(text, from, to, trace)
             }
+            guard self.current(id: id) else { return }
             let translatedAt = Date()
             probe?.translation = result
             probe?.translatedAt = translatedAt
@@ -449,31 +549,37 @@ final class SpeakEngine {
             }
             guard let translated = result else {
                 debugLog("speak: translation failed, nothing sent")
-                if probe == nil { onTiming?(timing(voice: nil)) }
-                phase = .idle
-                onLive?(.idle, text, L("翻译失败，这句话未发送"))
-                probe?.finish()
+                if probe == nil { self.onTiming?(timing(voice: nil)) }
+                self.onLive?(.idle, text, L("翻译失败，这句话未发送"))
                 return
             }
             contentLog("SPEAK [\(from)→\(to)] via=\(trace.via) \(text) => \(translated)")
             debugLog("speak: via=\(trace.via) recognize \(String(format: "%.2f", textAt.timeIntervalSince(released))) s translate \(String(format: "%.2f", translatedAt.timeIntervalSince(textAt))) s fallbacks=\(trace.fallbacks)")
-            if probe == nil { onUtterance?(text, translated, from, to, Date().timeIntervalSince(pressStarted)) }
-            phase = .speaking
-            onLive?(.speaking, text, translated)
-            await speak(translated, language: to)
+            self.phase = .speaking
+            self.onLive?(.speaking, text, translated)
+            let played = await self.speak(translated, language: to)
+            guard self.current(id: id) else { return }
             if let probe {
-                probe.firstAudioAt = firstAudioAt
-                probe.voice = lastVoice
-                probe.device = lastDevice
-                probe.finish()
-            } else {
-                onTiming?(timing(voice: Date().timeIntervalSince(translatedAt)))
-                if let first = firstAudioAt { onLatency?(first.timeIntervalSince(released)) }
+                probe.firstAudioAt = self.firstAudioAt
+                probe.voice = self.lastVoice
+                probe.device = self.lastDevice
             }
-            if phase == .speaking { phase = .idle }
-            onLive?(.idle, text, translated)
+            guard played else {
+                debugLog("speak: voice failed, nothing recorded")
+                self.onLive?(.idle, text, L("语音输出失败，这句话未发送"))
+                return
+            }
+            // An utterance enters the meeting only after its audio has actually played.
+            if probe == nil {
+                self.onUtterance?(text, translated, from, to, Date().timeIntervalSince(started))
+                self.onTiming?(timing(voice: Date().timeIntervalSince(translatedAt)))
+                if let first = self.firstAudioAt { self.onLatency?(first.timeIntervalSince(released)) }
+            }
+            self.onLive?(.idle, text, translated)
         }
     }
+
+    private func current(id: Int) -> Bool { id == pressGeneration && !Task.isCancelled }
 
     // MARK: Voice output
 
@@ -482,6 +588,13 @@ final class SpeakEngine {
         let lang = code == "zh-CN" ? "zh-CN" : code == "zh-TW" ? "zh-TW" : code
         let voices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix(lang) }
         return voices.max(by: { $0.quality.rawValue < $1.quality.rawValue }) ?? AVSpeechSynthesisVoice(language: lang)
+    }
+
+    lazy var chooseOutput: () -> OutputDevice? = { [weak self] in
+        guard let self else { return nil }
+        let all = AudioDevices.outputs()
+        if !self.settings.speakOutput.isEmpty, let d = all.first(where: { $0.uid == self.settings.speakOutput }) { return d }
+        return all.first(where: \.isVirtualMic)
     }
 
     func outputDevice() -> OutputDevice? {
@@ -508,6 +621,22 @@ final class SpeakEngine {
         }
     }
 
+    /// The real output boundary. Tests replace these with deterministic failures; the default
+    /// path remains AVSpeechSynthesizer → AVAudioEngine → AVAudioPlayerNode.
+    lazy var synthesizeOutput: (_ text: String, _ language: String, _ voiceID: String?) async -> [AVAudioPCMBuffer]? = {
+        [weak self] text, language, voiceID in await self?.synthesize(text, language: language, voiceID: voiceID)
+    }
+    lazy var startOutput: () throws -> Void = { [weak self] in
+        guard let self, !self.out.isRunning else { return }
+        try self.out.start()
+    }
+    lazy var configurePlayback: (AVAudioFormat, OutputDevice?) throws -> Void = { [weak self] format, device in
+        try self?.configureOutput(format: format, device: device)
+    }
+    lazy var playOutput: (_ buffers: [AVAudioPCMBuffer], _ onPlayed: @escaping (Bool) -> Void) -> Void = {
+        [weak self] buffers, onPlayed in self?.play(buffers, onPlayed: onPlayed)
+    }
+
     /// `device` overrides the chosen output (the virtual mic sound test).
     /// How a language is voiced: a PCM stream (Ming's built-in voices or the user's cloned one) or
     /// a voice on this Mac (nil: the best one for the language).
@@ -519,56 +648,76 @@ final class SpeakEngine {
     /// Set by the app: the voice chosen for a language.
     var route: ((String) -> VoiceRoute)?
 
-    /// Returns after the audio has played. A stream that fails before any audio falls back to the
-    /// Mac's voice, so the room always hears the sentence.
-    func speak(_ text: String, language: String, device override: OutputDevice? = nil, route forced: VoiceRoute? = nil) async {
+    /// Returns true only after the whole utterance has played. A stream that fails before any
+    /// audio falls back to the Mac's voice; failure after the first sound is reported as failure.
+    @discardableResult
+    func speak(_ text: String, language: String, device override: OutputDevice? = nil, route forced: VoiceRoute? = nil) async -> Bool {
+        resetOutput()
+        let id = speechGeneration
         var voiceID: String?
         firstAudioAt = nil
-        lastDevice = override ?? outputDevice()
+        lastDevice = override ?? chooseOutput()
+        let device = override ?? chooseOutput()
         switch forced ?? route?(language) ?? .system(nil) {
         case .stream(let make):
             lastVoice = "ming"
-            if await speakStream(make(text), device: override ?? outputDevice()) { return }
+            let streamed = await speakStream(make(text), device: device, id: id)
+            guard id == speechGeneration else { return false }
+            if streamed { return true }
+            // No sound yet: try the system voice. A stream that broke after sending audio has
+            // already produced a partial utterance; a fallback success must not relabel it sent.
+            if streamHadAudio { return false }
             lastVoice = "system (ming failed)"
         case .system(let id):
             lastVoice = "system"
             voiceID = id
         }
-        let buffers = await synthesize(text, language: language, voiceID: voiceID)
-        guard let first = buffers.first else { return }
+        guard let buffers = await synthesizeOutput(text, language, voiceID), let first = buffers.first,
+              id == speechGeneration, !Task.isCancelled else { return false }
         if let url = debugOutputURL, let f = AudioFileWriter.open(url, format: first.format) {
             for b in buffers { try? f.write(from: b) }
         }
-        let device = override ?? outputDevice()
-        configureOutput(format: first.format, device: device)
         do {
-            if !out.isRunning { try out.start() }
+            try configurePlayback(first.format, device)
+            try startOutput()
         } catch {
             debugLog("voice output failed: \(error)")
-            return
+            return false
         }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            for (i, b) in buffers.enumerated() {
-                if i == buffers.count - 1 {
-                    player.scheduleBuffer(b, completionCallbackType: .dataPlayedBack) { _ in cont.resume() }
-                } else {
-                    player.scheduleBuffer(b)
+        let played = await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                var resumed = false
+                let resume: (Bool) -> Void = { played in
+                    guard !resumed else { return }
+                    resumed = true
+                    self.playbackDone = nil
+                    cont.resume(returning: played)
                 }
+                self.playbackDone = { resume(false) }
+                firstAudioAt = Date()
+                playOutput(buffers, resume)
             }
-            firstAudioAt = Date()
-            player.play()
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.speechGeneration == id else { return }
+                self.resetOutput()
+            }
         }
+        guard played, id == speechGeneration, !Task.isCancelled else { return false }
         var cur = AudioObjectID(0); var sz = UInt32(MemoryLayout<AudioObjectID>.size)
         if let unit = out.outputNode.audioUnit {
             AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &cur, &sz)
         }
         debugLog("spoke \(buffers.count) buffers to \(device?.name ?? "default output") id=\(device?.id ?? 0) readback=\(cur)")
+        return true
     }
 
     /// Core Audio restarted (virtual mic install): device IDs changed, rebuild the output next time.
     /// Plays 24 kHz mono 16-bit PCM chunks as they arrive. Returns false if nothing came, so the
     /// caller can fall back to the system voice.
-    private func speakStream(_ stream: AsyncThrowingStream<Data, Error>, device: OutputDevice?) async -> Bool {
+    private var streamHadAudio = false
+    private func speakStream(_ stream: AsyncThrowingStream<Data, Error>, device: OutputDevice?, id: Int) async -> Bool {
+        streamHadAudio = false
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false) else { return false }
         let started = Date()
         var carry = Data()
@@ -576,6 +725,7 @@ final class SpeakEngine {
         var firstAt: TimeInterval?
         do {
             for try await chunk in stream {
+                guard id == speechGeneration, !Task.isCancelled else { return false }
                 var bytes = carry + chunk
                 if bytes.count % 2 == 1 { carry = bytes.suffix(1); bytes = bytes.dropLast() } else { carry = Data() }
                 let frames = bytes.count / 2
@@ -589,45 +739,80 @@ final class SpeakEngine {
                 if count == 0 {
                     firstAt = Date().timeIntervalSince(started)
                     firstAudioAt = Date()
-                    configureOutput(format: format, device: device)
-                    if !out.isRunning { try out.start() }
+                    try configurePlayback(format, device)
+                    try startOutput()
                 }
-                player.scheduleBuffer(buf, completionHandler: nil)
+                playOutput([buf], { _ in })
                 if !player.isPlaying { player.play() }
                 count += 1
             }
         } catch {
+            guard id == speechGeneration, !Task.isCancelled else { return false }
             debugLog("ming voice failed: \(error)")
-            if count == 0 { return false }
+            streamHadAudio = count > 0
+            return false
         }
-        guard count > 0 else { return false }
+        guard count > 0, id == speechGeneration, !Task.isCancelled else { return false }
         // Wait for the queued audio to finish before the next utterance.
         if let tail = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 240) {
             tail.frameLength = 240
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                player.scheduleBuffer(tail, completionCallbackType: .dataPlayedBack) { _ in cont.resume() }
+            let played = await withTaskCancellationHandler {
+                await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                    var resumed = false
+                    let resume: (Bool) -> Void = { played in
+                        guard !resumed else { return }
+                        resumed = true
+                        self.playbackDone = nil
+                        cont.resume(returning: played)
+                    }
+                    self.playbackDone = { resume(false) }
+                    playOutput([tail], resume)
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                guard let self, self.speechGeneration == id else { return }
+                self.resetOutput()
             }
+            }
+            guard played, id == speechGeneration, !Task.isCancelled else { return false }
         }
         debugLog("spoke ming \(count) chunks to \(device?.name ?? "default output") first audio \(String(format: "%.2f", firstAt ?? 0)) s")
         return true
     }
 
+    private func play(_ buffers: [AVAudioPCMBuffer], onPlayed: @escaping (Bool) -> Void) {
+        for (i, b) in buffers.enumerated() {
+            if i == buffers.count - 1 {
+                player.scheduleBuffer(b, completionCallbackType: .dataPlayedBack) { _ in onPlayed(true) }
+            } else {
+                player.scheduleBuffer(b)
+            }
+        }
+        player.play()
+    }
+
     func resetOutput() {
+        speechGeneration += 1
         player.stop()
         out.stop()
+        playbackDone?()
+        playbackDone = nil
         outFormat = nil
         outDeviceUID = nil
     }
 
-    private func configureOutput(format: AVAudioFormat, device: OutputDevice?) {
+    private func configureOutput(format: AVAudioFormat, device: OutputDevice?) throws {
         let uid = device?.uid ?? ""
         guard outFormat != format || outDeviceUID != uid else { return }
         player.stop()
         out.stop()
         if let device, let unit = out.outputNode.audioUnit {
             var id = device.id
-            AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                                 &id, UInt32(MemoryLayout<AudioObjectID>.size))
+            let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                              &id, UInt32(MemoryLayout<AudioObjectID>.size))
+            guard status == noErr else {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            }
         }
         out.disconnectNodeOutput(player)
         out.connect(player, to: out.mainMixerNode, format: format)

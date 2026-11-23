@@ -140,6 +140,8 @@ final class LingClient: ObservableObject {
     static let models = ["Ling-3.1-flash", "Ling-3.0-flash"]
     private static let base = URL(string: "https://api.ant-ling.com/v1/")!
     private static let hijackPrefixes = ["根据现有检索证据", "暂未找到足够可靠的信息", "根据检索"]
+    private var keyGeneration = 0
+    var checkTransport: ((String, [String: Any], String, TimeInterval) async throws -> [String: Any])?
 
     @Published private(set) var keyState: KeyState
     @Published private(set) var rateLimitedAt: Date?
@@ -156,14 +158,20 @@ final class LingClient: ObservableObject {
     /// The key is known to work (or at least not known to be bad).
     var usable: Bool { hasKey && keyState != .invalid }
 
-    init() {
-        keyState = AIKey.read() == nil ? .none : .unchecked
+    init(readStoredKey: Bool = true) {
+        keyState = readStoredKey && AIKey.read() != nil ? .unchecked : .none
+        keyGeneration = 1
+        checkTransport = { [weak self] path, body, key, timeout in
+            guard let self else { throw Failure.network }
+            return try await self.post(path, body: body, key: key, timeout: timeout)
+        }
     }
 
     // MARK: Key
 
     /// Saves the key and checks it with the cheapest possible request.
     func setKey(_ raw: String) async {
+        keyGeneration += 1
         let k = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !k.isEmpty else { return }
         if hideKey { debugLog("ai key: not saved while hidden (debug)"); keyState = .invalid; return }
@@ -172,12 +180,26 @@ final class LingClient: ObservableObject {
     }
 
     func removeKey() {
+        keyGeneration += 1
         AIKey.remove()
         keyState = .none
     }
 
     func check() async {
+        keyGeneration += 1
+        let id = keyGeneration
         guard let key else { keyState = .none; return }
+        await validateKey(key, id: id)
+    }
+
+    /// Kept separate from request cancellation: an earlier key's response may still arrive, but
+    /// it can never overwrite a later check, replacement or removal.
+    func nextKeyValidation(_ key: String) async {
+        keyGeneration += 1
+        await validateKey(key, id: keyGeneration)
+    }
+
+    private func validateKey(_ key: String, id: Int) async {
         keyState = .checking
         let started = Date()
         let body: [String: Any] = [
@@ -187,13 +209,15 @@ final class LingClient: ObservableObject {
             "thinking": ["type": "disabled"],
         ]
         do {
-            _ = try await post("chat/completions", body: body, key: key, timeout: 15)
+            _ = try await checkTransport?("chat/completions", body, key, 15)
             keyState = .ok(seconds: Date().timeIntervalSince(started))
         } catch Failure.invalidKey {
+            guard id == keyGeneration else { return }
             keyState = .invalid
         } catch Failure.rateLimited {
             keyState = .ok(seconds: Date().timeIntervalSince(started))
         } catch {
+            guard id == keyGeneration else { return }
             keyState = .unreachable(L("连不上 Ling，检查网络或代理"))
         }
         debugLog("ling: key check → \(keyState)")
@@ -296,6 +320,7 @@ final class LingClient: ObservableObject {
         AsyncThrowingStream { cont in
             let task = Task { @MainActor [weak self] in
                 guard let self, let key = self.key else { cont.finish(throwing: Failure.noKey); return }
+                let keyGeneration = self.keyGeneration
                 await self.acquire(.speak)
                 var req = URLRequest(url: Self.base.appendingPathComponent("audio/speech"))
                 req.httpMethod = "POST"
@@ -313,13 +338,13 @@ final class LingClient: ObservableObject {
                     body["voice"] = voice
                 }
                 if let language { body["language_id"] = language }
-                req.httpBody = try? JSONSerialization.data(withJSONObject: body)
                 do {
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
                     let (bytes, response) = try await URLSession.shared.bytes(for: req)
                     switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
                     case 200: break
                     case 401, 403:
-                        self.keyState = .invalid
+                        if keyGeneration == self.keyGeneration { self.keyState = .invalid }
                         throw Failure.invalidKey
                     case 429: throw Failure.rateLimited
                     case let code: throw Failure.http(code)

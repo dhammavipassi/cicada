@@ -45,7 +45,7 @@ final class VirtualMicInstaller: ObservableObject {
     static let testPhrase = "Hi, can you hear me?"
 
     /// Plays text through a given device; provided by the speak engine.
-    var speakThrough: ((_ text: String, _ language: String, _ device: OutputDevice) async -> Void)?
+    var speakThrough: ((_ text: String, _ language: String, _ device: OutputDevice) async -> Bool)?
     /// Called once Core Audio has the device (after an install or reload).
     var onLoaded: (() -> Void)?
 
@@ -104,7 +104,7 @@ final class VirtualMicInstaller: ObservableObject {
                 return
             }
             test = await LoopbackTest.run(device: device, phrase: Self.testPhrase) { [weak self] in
-                await self?.speakThrough?(Self.testPhrase, "en", device)
+                _ = await self?.speakThrough?(Self.testPhrase, "en", device)
             }
             debugLog("virtual mic test: mic=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) heard=\(test?.heard ?? false) text=\(test?.text ?? "")")
             state = .idle

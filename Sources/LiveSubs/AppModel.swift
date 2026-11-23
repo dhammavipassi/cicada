@@ -161,7 +161,7 @@ final class AppModel: ObservableObject {
         if ling.hasKey { Task { await ling.check() } }
 
         installer.speakThrough = { [weak self] text, lang, device in
-            await self?.speak.speak(text, language: lang, device: device)
+            await self?.speak.speak(text, language: lang, device: device) ?? false
         }
         installer.onLoaded = { [weak self] in self?.virtualMicInstalled() }
 

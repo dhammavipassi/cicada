@@ -26,16 +26,16 @@ def specs(s):
 
 
 def code_keys():
-    out = tempfile.mkdtemp()
-    subprocess.run(["swift", "build", "--product", "LiveSubs", "-Xswiftc", "-emit-localized-strings",
-                    "-Xswiftc", "-emit-localized-strings-path", "-Xswiftc", out],
-                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
     keys = {}
-    for f in sorted(glob.glob(os.path.join(out, "*.stringsdata"))):
-        for entries in json.load(open(f))["tables"].values():
-            for e in entries:
-                if CJK.search(e["key"]):  # "%@ · %@" and the like need no translation
-                    keys.setdefault(e["key"], os.path.basename(f).split(".")[0])
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run(["swift", "build", "--product", "LiveSubs", "-Xswiftc", "-emit-localized-strings",
+                        "-Xswiftc", "-emit-localized-strings-path", "-Xswiftc", out],
+                       cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+        for f in sorted(glob.glob(os.path.join(out, "*.stringsdata"))):
+            for entries in json.load(open(f))["tables"].values():
+                for e in entries:
+                    if CJK.search(e["key"]):  # "%@ · %@" and the like need no translation
+                        keys.setdefault(e["key"], os.path.basename(f).split(".")[0])
     return keys
 
 

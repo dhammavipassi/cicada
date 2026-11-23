@@ -608,15 +608,26 @@ struct MainWindowView: View {
         // One white sheet; the list sits on a faint tint instead of behind a rule. The listening
         // pill lives in the window's toolbar (`MainToolbar`). With no meetings yet, only the
         // welcome shows: an empty list is noise.
-        HStack(spacing: 0) {
-            if !store.sessions.isEmpty {
-                sidebar
-                    .frame(width: 232)
-                    .background(UnevenRoundedRectangle(topTrailingRadius: 14).fill(Self.listTint).ignoresSafeArea(edges: .bottom))
+        VStack(spacing: 0) {
+            if let error = store.persistenceError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.error)
+                    .lineLimit(2)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Palette.errorPale)
             }
-            detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { detailWidth = $0 }
+            HStack(spacing: 0) {
+                if !store.sessions.isEmpty {
+                    sidebar
+                        .frame(width: 232)
+                        .background(UnevenRoundedRectangle(topTrailingRadius: 14).fill(Self.listTint).ignoresSafeArea(edges: .bottom))
+                }
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { detailWidth = $0 }
+            }
         }
         .background(Color.white.ignoresSafeArea())
         .background(Button("") { searchFocused = true }.keyboardShortcut("f").opacity(0))

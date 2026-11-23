@@ -64,6 +64,9 @@ struct Session: Codable, Identifiable, Equatable {
 final class SessionStore: ObservableObject {
     @Published private(set) var sessions: [Session] = []
     @Published private(set) var liveID: String?
+    /// The last failed read or write of a `session.json`; nil once a save succeeds. Shown in the
+    /// main window, so a meeting that did not reach disk is not silently treated as saved.
+    @Published private(set) var persistenceError: String?
 
     let root: URL
     private var saveWork: DispatchWorkItem?
@@ -84,9 +87,12 @@ final class SessionStore: ObservableObject {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var out: [Session] = []
+        var readError: String?
         for dir in dirs {
-            if let data = try? Data(contentsOf: dir.appendingPathComponent("session.json")),
-               var s = try? decoder.decode(Session.self, from: data) {
+            let file = dir.appendingPathComponent("session.json")
+            do {
+                let data = try Data(contentsOf: file)
+                var s = try decoder.decode(Session.self, from: data)
                 if s.endedAt == nil { s.endedAt = s.lines.last.map { s.startedAt.addingTimeInterval($0.t + 5) } ?? s.startedAt }
                 // The app quit mid-meeting: its recording is still in the partial file.
                 if s.id != liveID, hasPartialAudio(s.id) {
@@ -94,9 +100,18 @@ final class SessionStore: ObservableObject {
                     finishAudio(s.id)
                 }
                 out.append(s)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                // begin() makes the folder before the first save: no session.json is a normal partial state.
+                debugLog("session load skipped, no session.json at \(file.path): \(error)")
+            } catch {
+                debugLog("session load failed at \(file.path): \(error)")
+                if readError == nil {
+                    readError = "读取会议记录失败：\(file.path)（\(error.localizedDescription)）"
+                }
             }
         }
         sessions = out.sorted { $0.startedAt > $1.startedAt }
+        persistenceError = readError
     }
 
     // MARK: Live session
@@ -258,9 +273,15 @@ final class SessionStore: ObservableObject {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(s) else { return }
-        try? FileManager.default.createDirectory(at: folder(id), withIntermediateDirectories: true)
-        try? data.write(to: folder(id).appendingPathComponent("session.json"), options: .atomic)
+        do {
+            let data = try encoder.encode(s)
+            try FileManager.default.createDirectory(at: folder(id), withIntermediateDirectories: true)
+            try data.write(to: folder(id).appendingPathComponent("session.json"), options: .atomic)
+            persistenceError = nil
+        } catch {
+            debugLog("session save failed at \(folder(id).path): \(error)")
+            persistenceError = "保存失败：\(id)（\(error.localizedDescription)）"
+        }
     }
 }
 

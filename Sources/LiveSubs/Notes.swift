@@ -207,8 +207,15 @@ final class NotesEngine: ObservableObject {
             if fresh { pendingRewrite = id }
             return
         }
-        guard let session = store.session(id), !session.lines.isEmpty else { return }
-        guard ling.hasKey else { state = .noKey; return }
+        guard let session = store.session(id), !session.lines.isEmpty else {
+            if final, generatingID == id { generatingID = nil }
+            return
+        }
+        guard ling.hasKey else {
+            if final, generatingID == id { generatingID = nil }
+            state = .noKey
+            return
+        }
         inFlight = true
         lastAttempt = Date()
         state = .updating

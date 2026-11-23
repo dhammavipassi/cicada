@@ -141,6 +141,45 @@ scripts/package.sh          # 打包正式版 DMG、zip 和 SHA-256 校验值
 
 代码架构等说明写在 [AGENTS.md](AGENTS.md) 里。官网源码放在 `site/` 目录，由 `scripts/site.py` 生成。历次更新记录见 [CHANGELOG.md](CHANGELOG.md) 或官网的[更新日志页](https://cicada.indaloop.app/changelog/)。
 
+```mermaid
+flowchart LR
+  subgraph AudioIn["音频输入与热键"]
+    SysAudio["macOS 系统声音"] --> Tap["SystemAudioTap (Core Audio Process Tap)"]
+    Mic["实体麦克风 (SystemMic)"] --> Speak["SpeakEngine"]
+    Key["快捷键 (右 Option / Carbon HotKey)"] --> Speak
+  end
+
+  subgraph ListenPipe["收听与转写链"]
+    Tap --> Router["AudioRouter (PCM, Ring, 16 kHz, AAC)"]
+    Router --> Listen["ListenEngine (SpeechAnalyzer + LanguageDetector)"]
+    Router --> SpeakerID["SpeakerTagger (Core ML 声纹)"]
+    Listen --> Trans["TranslationService (Ling / Google / Apple)"]
+  end
+
+  subgraph SpeakPipe["同声传译链"]
+    Speak -->|"语音或转写"| Trans
+    Trans --> Speak
+    Speak -->|"Ming TTS / AVSpeechSynthesizer"| VMic["BlackHole 2ch (VirtualMic)"]
+    VMic --> CallApp["会议应用"]
+  end
+
+  subgraph Core["中枢与持久化 (@MainActor)"]
+    App["AppModel"]
+    Store["SessionStore (session.json + m4a)"]
+    Notes["NotesEngine (实时与终版纪要)"]
+    Ling["LingClient (0600 密钥与优先级限流)"]
+  end
+
+  Listen --> App
+  SpeakerID --> App
+  Speak --> App
+  App --> Store
+  App --> Notes
+  Trans --> Ling
+  Notes --> Ling
+  Speak --> Ling
+```
+
 ## 开源协议
 
 本项目采用 [Apache-2.0](LICENSE) 协议开源。同声传译用到的虚拟麦克风驱动 BlackHole 2ch 采用 GPL 协议，知了安装包里不打包它，在你点安装时直接从它的官方发布地址下载。随 app 附带的声纹模型是 [WeSpeaker](https://github.com/wenet-e2e/wespeaker) 在 VoxCeleb 上训练的 ResNet34-LM，采用 CC BY 4.0 协议，由 `scripts/convert-voiceprint.py` 转成 Core ML。

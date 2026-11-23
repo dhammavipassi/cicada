@@ -287,12 +287,15 @@ final class SpeakTester: ObservableObject {
     }
 
     func cancel() {
-        if phase == .talking { speak.pressCancelled() }
-        speak.probe = nil
+        // Closing after release must cancel recognition, translation and playback too, not just
+        // the progress watcher. Otherwise a rehearsal can still enter the real meeting record.
+        speak.pressCancelled()
+        speak.prepareProbe(nil)
         probe?.finish()
         _ = recorder?.stop()
         recorder = nil
         running?.cancel()
+        running = nil
         phase = .idle
         stopPlaying()
     }
@@ -324,8 +327,9 @@ final class SpeakTester: ObservableObject {
         }
         self.recorder = recorder
         let probe = SpeakProbe()
+        guard !Task.isCancelled, phase != .idle else { _ = recorder.stop(); return }
         self.probe = probe
-        speak.probe = probe
+        speak.prepareProbe(probe)
 
         switch mode {
         case .sample:
@@ -333,7 +337,7 @@ final class SpeakTester: ObservableObject {
             let buffers = await Self.synthesize(Self.sampleSentence(for: settings.speakFromLang.code),
                                                 locale: settings.speakFromLang.locale)
             guard !buffers.isEmpty, await speak.speakBuffers(buffers) else {
-                speak.probe = nil
+                speak.prepareProbe(nil)
                 _ = recorder.stop()
                 finish(with: r, broken: .mic, problem: L("语音识别还没准备好，请稍后再试"))
                 return
@@ -468,7 +472,7 @@ final class SpeakTester: ObservableObject {
     private func finish(with r: SpeakTestResult, broken: SpeakTestResult.Stage? = nil, problem: String? = nil) {
         var r = r
         if let broken { r.broken = broken; r.problem = problem }
-        speak.probe = nil
+        speak.prepareProbe(nil)
         result = r
         phase = .done
         probe = nil

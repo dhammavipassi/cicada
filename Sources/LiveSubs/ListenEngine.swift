@@ -45,6 +45,12 @@ final class ListenEngine {
     private var analyzer: SpeechAnalyzer?
     private var resultsTask: Task<Void, Never>?
     private var generation = 0
+    private var targetGeneration = 0
+    private var detectionGeneration = 0
+    private var translationTasks: [Int: Task<Void, Never>] = [:]
+    /// Test seams for late asynchronous completions; production uses the same closures below.
+    var translateText: ((String, String, String, TranslationService.Kind, TranslateTrace) async -> String?)?
+    var rankLanguages: (([AVAudioPCMBuffer], [Lang]) async -> [LanguageDetector.Candidate])?
     private var pendingSwitch: Lang?
     private var needsDetection = true
     private var nextPeriodicDetection = 30.0
@@ -62,6 +68,7 @@ final class ListenEngine {
     private var volatileTranslation = ""
     private var lastVolatileSent = ""
     private var volatileInFlight = false
+    private var volatileTask: Task<Void, Never>?
     private var volatileEpoch = 0
     private var tickTimer: Timer?
     private var ticks = 0
@@ -79,6 +86,11 @@ final class ListenEngine {
 
     init(settings: AppSettings) {
         self.settings = settings
+        translateText = { [weak self] text, source, target, kind, trace in
+            guard let self else { return nil }
+            return await self.translator?.translate(text, source: source, target: target, kind: kind, trace: trace)
+        }
+        rankLanguages = { clip, candidates in await LanguageDetector.rank(clip, candidates: candidates) }
     }
 
     var resolvedTarget: String { settings.resolvedTarget(source: activeLang?.code) }
@@ -148,6 +160,9 @@ final class ListenEngine {
     func stop() {
         isRunning = false
         generation += 1
+        detectionGeneration += 1
+        for (_, task) in translationTasks { task.cancel() }
+        translationTasks.removeAll()
         tickTimer?.invalidate()
         tickTimer = nil
         audioTap?.stop()
@@ -164,6 +179,8 @@ final class ListenEngine {
         volatileTranslation = ""
         lastVolatileSent = ""
         volatileInFlight = false
+        volatileTask?.cancel()
+        volatileTask = nil
         detecting = false
         setStatus(L("已暂停"))
     }
@@ -213,6 +230,8 @@ final class ListenEngine {
     }
 
     func targetChanged() {
+        targetGeneration += 1
+        volatileEpoch += 1
         retranslateVisible()
         onStateChange?()
     }
@@ -247,6 +266,9 @@ final class ListenEngine {
     private func switchTranscriber(to lang: Lang, replaySeconds: Double = 0) async {
         generation += 1
         let gen = generation
+        detectionGeneration += 1
+        for (_, task) in translationTasks { task.cancel() }
+        translationTasks.removeAll()
         router.detach()
         resultsTask?.cancel()
         resultsTask = nil
@@ -399,6 +421,34 @@ final class ListenEngine {
         onSubtitle?(source, parts.joined(separator: tgtJoin.isEmpty ? "" : " "))
     }
 
+    func acceptSegmentForTest(_ text: String) {
+        let seg = Segment(id: nextSegmentID, text: text, sourceCode: "en", clock: generation)
+        nextSegmentID += 1
+        segments = [seg]
+        translateSegment(id: seg.id)
+        onFinal?(seg, 0)
+    }
+
+    func startMeetingForTest() {
+        isRunning = true
+        generation += 1
+        detectionGeneration += 1
+        detecting = false
+        activeLang = nil
+        segments = []
+        volatileText = ""
+        nextSegmentID = 0
+    }
+
+    func detectForTest(using buffer: AVAudioPCMBuffer) {
+        isRunning = true
+        settings.sourceMode = .auto
+        candidates = sourceLanguages
+        lastDetectionAt = .distantPast
+        router.push(buffer)
+        maybeDetectLanguage()
+    }
+
     // MARK: Language detection
 
     private func maybeDetectLanguage() {
@@ -415,14 +465,16 @@ final class ListenEngine {
         needsDetection = false
         lastDetectionAt = Date()
         detecting = true
+        detectionGeneration += 1
+        let detectionID = detectionGeneration
         nextPeriodicDetection = stats.voicedTotal + 20
         onStateChange?()
         let clip = router.snapshot(seconds: clipSeconds)
         let candidates = self.candidates
         Task { [weak self] in
             let started = Date()
-            let ranked = await LanguageDetector.rank(clip, candidates: candidates)
-            guard let self else { return }
+            let ranked = await self?.rankLanguages?(clip, candidates) ?? []
+            guard let self, detectionID == self.detectionGeneration else { return }
             self.detecting = false
             guard self.isRunning, self.settings.sourceMode == .auto else { return }
             let summary = ranked.map { String(format: "%@ s=%.2f c=%.2f n=%d", $0.lang.locale, $0.score, $0.confidence, $0.chars) }
@@ -506,7 +558,8 @@ final class ListenEngine {
                    kind: TranslationService.Kind = .sentence, trace: TranslateTrace? = nil) async -> String? {
         let target = target ?? resolvedTarget
         if source == target { return text }
-        let out = await translator?.translate(text, source: source, target: target, kind: kind, trace: trace)
+        let out = await translateText?(text, source, target, kind, trace ?? TranslateTrace())
+        guard !Task.isCancelled, target == resolvedTarget, isRunning else { return nil }
         if out == nil, segments.allSatisfy({ $0.translation == nil }) && volatileTranslation.isEmpty {
             onSubtitle?(volatileText.isEmpty ? (segments.last?.text ?? "") : volatileText, L("翻译暂不可用"))
         }
@@ -517,9 +570,15 @@ final class ListenEngine {
         guard !translationOff(), let seg = segments.first(where: { $0.id == id }) else { return }
         let trace = TranslateTrace()
         let asked = Date()
-        Task { [weak self] in
+        let meeting = generation
+        let target = targetGeneration
+        translationTasks[id]?.cancel()
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer { if !Task.isCancelled { self.translationTasks[id] = nil } }
             let result = await self.translate(seg.text, source: seg.sourceCode, trace: trace)
+            guard meeting == self.generation, target == self.targetGeneration,
+                  self.isRunning, !Task.isCancelled else { return }
             if let timing = self.finalTiming.removeValue(forKey: id), !trace.attempts.isEmpty {
                 self.onTiming?(SentenceTiming(at: timing.at, side: "them", chars: seg.text.count, recognize: timing.recognize,
                                               queue: trace.lingQueue, translate: Date().timeIntervalSince(asked), voice: nil,
@@ -527,7 +586,6 @@ final class ListenEngine {
                                               fallbacks: trace.fallbacks))
             }
             guard let out = result else { return }
-            guard self.isRunning else { return }
             // The line was joined with the next one meanwhile: only the whole sentence's translation counts.
             if let now = self.segments.first(where: { $0.id == id }), now.text != seg.text { return }
             if let idx = self.segments.firstIndex(where: { $0.id == id }) {
@@ -537,6 +595,7 @@ final class ListenEngine {
             self.onTranslated?(id, out)
             self.renderSubtitles()
         }
+        translationTasks[id] = task
     }
 
     /// The app joined segment `id` onto `into` (one sentence cut by a pause): the bar shows them as
@@ -602,11 +661,14 @@ final class ListenEngine {
         let source = activeLang?.code ?? "auto"
         lastVolatileSent = text
         volatileInFlight = true
-        Task { [weak self] in
+        let meeting = generation
+        let target = targetGeneration
+        volatileTask = Task { [weak self] in
             guard let self else { return }
             let out = await self.translate(text, source: source, kind: .draft)
             self.volatileInFlight = false
-            guard let out, self.isRunning, epoch == self.volatileEpoch else { return }
+            guard let out, self.isRunning, meeting == self.generation, target == self.targetGeneration,
+                  epoch == self.volatileEpoch, !Task.isCancelled else { return }
             self.volatileTranslation = out
             self.renderSubtitles()
         }

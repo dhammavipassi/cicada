@@ -571,6 +571,7 @@
 "语音识别仍在准备中，请再按一次" = "Speech recognition is still getting ready; press again";
 "没有可用的麦克风" = "No microphone available";
 "麦克风无法启动，请在系统设置里允许%@使用麦克风" = "The microphone won't start. Allow %@ to use it in System Settings";
+"语音输出失败，这句话未发送" = "Voice output failed; this sentence wasn't sent";
 "翻译失败，这句话未发送" = "Translation failed; this sentence wasn't sent";
 
 /* SpeakTest */

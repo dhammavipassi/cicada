@@ -244,6 +244,8 @@ final class VoiceRecorder: ObservableObject {
     }
 
     /// Stops recording and transcribes it; `ready` when it is long enough and recognisable.
+    private var checkGeneration = 0
+
     func finish() {
         guard phase == .recording else { return }
         stopEngine()
@@ -252,15 +254,19 @@ final class VoiceRecorder: ObservableObject {
             return
         }
         phase = .checking
+        checkGeneration += 1
+        let gen = checkGeneration
         let url = url, locale = locale
         Task {
             let text = await Self.transcribe(url, locale: locale)
+            guard self.checkGeneration == gen, self.phase == .checking else { return }
             self.transcript = text
             self.phase = text.count >= 6 ? .ready : .failed(L("没听清录音内容，请换个安静的地方再录一次"))
         }
     }
 
     func cancel() {
+        checkGeneration += 1
         stopEngine()
         phase = .idle
         try? FileManager.default.removeItem(at: url)

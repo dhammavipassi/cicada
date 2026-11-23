@@ -447,7 +447,7 @@ final class SpeakerNamer: ObservableObject {
 enum SpeakerColor {
     private static let inks: [Color] = [Color(red: 0.059, green: 0.482, blue: 0.424), Color(red: 0.478, green: 0.298, blue: 0.761),
                                         Color(red: 0.690, green: 0.227, blue: 0.478), Color(red: 0.541, green: 0.353, blue: 0)]
-    static func ink(_ n: Int) -> Color { inks[(n - 1) % inks.count] }
+    static func ink(_ n: Int) -> Color { inks[max(0, n - 1) % inks.count] }
 }
 
 /// "说话人 2" above a line.
