@@ -71,10 +71,14 @@ final class SessionStore: ObservableObject {
     let root: URL
     private var saveWork: DispatchWorkItem?
 
-    init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        root = base.appendingPathComponent("\(DevBuild.supportFolder)/Sessions", isDirectory: true)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    init(root: URL? = nil) {
+        if let root {
+            self.root = root
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            self.root = base.appendingPathComponent("\(DevBuild.supportFolder)/Sessions", isDirectory: true)
+        }
+        try? FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true)
         load()
     }
 
@@ -121,7 +125,14 @@ final class SessionStore: ObservableObject {
         let now = Date()
         let fid = DateFormatter()
         fid.dateFormat = "yyyyMMdd-HHmmss"
-        let s = Session(id: fid.string(from: now), title: Session.defaultTitle(now),
+        let baseID = fid.string(from: now)
+        var id = baseID
+        var suffix = 2
+        while index(id) != nil || FileManager.default.fileExists(atPath: folder(id).path) {
+            id = "\(baseID)-\(suffix)"
+            suffix += 1
+        }
+        let s = Session(id: id, title: Session.defaultTitle(now),
                         startedAt: now, endedAt: nil, lines: [], hasAudio: false)
         sessions.insert(s, at: 0)
         liveID = s.id
@@ -251,8 +262,17 @@ final class SessionStore: ObservableObject {
 
     func delete(_ id: String) {
         guard id != liveID, let i = index(id) else { return }
-        try? FileManager.default.removeItem(at: folder(id))
-        sessions.remove(at: i)
+        do {
+            try FileManager.default.removeItem(at: folder(id))
+            sessions.remove(at: i)
+            persistenceError = nil
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            sessions.remove(at: i)
+            persistenceError = nil
+        } catch {
+            debugLog("session delete failed at \(folder(id).path): \(error)")
+            persistenceError = "删除失败：\(id)（\(error.localizedDescription)）"
+        }
     }
 
     func session(_ id: String?) -> Session? { id.flatMap { index($0) }.map { sessions[$0] } }

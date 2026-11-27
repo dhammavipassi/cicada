@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// The main window's toolbar: the listening pill centred, settings on the right. A real toolbar,

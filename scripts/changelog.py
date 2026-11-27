@@ -55,7 +55,8 @@ def main():
         sys.exit("usage: scripts/changelog.py <x.y.z> [--print]")
     version = sys.argv[1]
     path = os.path.join(ROOT, "CHANGELOG.md")
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
     # The "## Unreleased" block, if any: its text becomes the summary.
     m = re.search(r"^## Unreleased\n(.*?)(?=^## |\Z)", text, re.M | re.S)
     summary = m.group(1).strip() if m else ""
@@ -69,7 +70,8 @@ def main():
         first = re.search(r"^## ", text, re.M)
         at = first.start() if first else len(text)
         text = text[:at] + new + "\n" + text[at:]
-    open(path, "w", encoding="utf-8").write(text)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 if __name__ == "__main__":

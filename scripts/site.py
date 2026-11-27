@@ -106,7 +106,7 @@ def anchor(version):
 def rev():
     try:
         return subprocess.check_output(["git", "rev-parse", "--short=12", "HEAD"], cwd=ROOT_DIR, text=True).strip()
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         return "dev"
 
 

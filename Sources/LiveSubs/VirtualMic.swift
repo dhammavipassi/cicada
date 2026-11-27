@@ -220,7 +220,9 @@ enum LoopbackTest {
                 for try await r in t.results where r.isFinal {
                     parts.append(String(r.text.characters).trimmingCharacters(in: .whitespaces))
                 }
-            } catch {}
+            } catch {
+                debugLog("loopback transcribe error: \(error)")
+            }
             return parts.joined(separator: " ")
         }
         let analyzer = SpeechAnalyzer(inputSequence: stream, modules: [t])

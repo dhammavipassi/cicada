@@ -293,4 +293,74 @@ struct AsyncLifecycleTests {
         await wait()
         #expect(e.activeLang == nil && !e.detecting)
     }
+
+    @Test func oldSuccessfulKeyValidationCannotOverwriteRemovalOrNewerFailure() async {
+        let ling = LingClient(readStoredKey: false)
+        var calls = 0
+        var finishOld: (() -> Void)?
+        ling.checkTransport = { _, _, _, _ in
+            calls += 1
+            if calls == 1 {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    finishOld = { cont.resume() }
+                }
+                return [:]
+            }
+            throw LingClient.Failure.invalidKey
+        }
+        async let old: Void = ling.validateKeyForTest("test-old")
+        #expect(await until { finishOld != nil })
+        async let newer: Void = ling.validateKeyForTest("test-new")
+        await newer
+        #expect(ling.keyState == .invalid)
+        finishOld?()
+        await old
+        #expect(ling.keyState == .invalid)
+
+        var finishRateLimited: (() -> Void)?
+        calls = 0
+        ling.checkTransport = { _, _, _, _ in
+            calls += 1
+            if calls == 1 {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    finishRateLimited = { cont.resume() }
+                }
+                throw LingClient.Failure.rateLimited
+            }
+            throw LingClient.Failure.invalidKey
+        }
+        async let oldRateLimited: Void = ling.validateKeyForTest("test-old-429")
+        #expect(await until { finishRateLimited != nil })
+        async let newerInvalid: Void = ling.validateKeyForTest("test-new-401")
+        await newerInvalid
+        #expect(ling.keyState == .invalid)
+        finishRateLimited?()
+        await oldRateLimited
+        #expect(ling.keyState == .invalid)
+    }
+
+    @Test func rapidSessionBeginProducesUniqueIDsAndDeletesCleanly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cicada-session-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = SessionStore(root: dir)
+        let first = store.begin()
+        store.append(TranscriptLine(id: "l1", t: 1, speaker: "them", src: "hello", dst: nil, srcLang: "en", dstLang: "zh"))
+        store.end()
+
+        let second = store.begin()
+        store.append(TranscriptLine(id: "l2", t: 1, speaker: "them", src: "world", dst: nil, srcLang: "en", dstLang: "zh"))
+        store.end()
+
+        #expect(first.id != second.id)
+        #expect(store.sessions.count == 2)
+        #expect(FileManager.default.fileExists(atPath: store.folder(first.id).appendingPathComponent("session.json").path))
+        #expect(FileManager.default.fileExists(atPath: store.folder(second.id).appendingPathComponent("session.json").path))
+
+        store.delete(first.id)
+        #expect(store.persistenceError == nil)
+        #expect(store.sessions.map(\.id) == [second.id])
+        #expect(!FileManager.default.fileExists(atPath: store.folder(first.id).path))
+    }
 }

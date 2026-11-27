@@ -32,7 +32,9 @@ def code_keys():
                         "-Xswiftc", "-emit-localized-strings-path", "-Xswiftc", out],
                        cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         for f in sorted(glob.glob(os.path.join(out, "*.stringsdata"))):
-            for entries in json.load(open(f))["tables"].values():
+            with open(f, encoding="utf-8") as fh:
+                tables = json.load(fh)["tables"]
+            for entries in tables.values():
                 for e in entries:
                     if CJK.search(e["key"]):  # "%@ · %@" and the like need no translation
                         keys.setdefault(e["key"], os.path.basename(f).split(".")[0])
@@ -56,7 +58,8 @@ def write(path, pairs):
             lines.append(f"\n/* {group} */")
             last = group
         lines.append(f'"{esc(k)}" = "{esc(v)}";')
-    open(path, "w").write("\n".join(lines).lstrip() + "\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).lstrip() + "\n")
 
 
 def main():

@@ -23,10 +23,13 @@ enum AIKey {
         if let cached { return cached }
         var value = (try? String(contentsOf: file, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
         if value?.isEmpty ?? true { value = nil }
-        if value == nil, let old = LegacyKeychain.take() {
+        if value == nil, let old = LegacyKeychain.read() {
             // One last Keychain prompt, then the key lives in the file.
             value = old
-            write(old)
+            if write(old) {
+                LegacyKeychain.delete()
+                debugLog("ai key: moved from the Keychain to the key file")
+            }
         }
         cached = .some(value)
         return value
@@ -48,24 +51,27 @@ enum AIKey {
     @discardableResult
     private static func write(_ key: String) -> Bool {
         let fm = FileManager.default
+        let tmp = folder.appendingPathComponent(".ling-api-key.\(UUID().uuidString).tmp")
         do {
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-            // Create it 0600 before the key goes in, so it is never readable by others.
-            if !fm.fileExists(atPath: file.path) {
-                guard fm.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-                    debugLog("ai key: could not create the key file")
-                    return false
-                }
+            // Create the temp file 0600 before writing the key, then swap it atomically.
+            guard fm.createFile(atPath: tmp.path, contents: Data(key.utf8), attributes: [.posixPermissions: 0o600]) else {
+                debugLog("ai key: could not create the key file")
+                return false
             }
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-            try Data(key.utf8).write(to: file)
-            var url = file
+            var tmpURL = tmp
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
-            try? url.setResourceValues(values)
+            try? tmpURL.setResourceValues(values)
+            if fm.fileExists(atPath: file.path) {
+                _ = try fm.replaceItemAt(file, withItemAt: tmp)
+            } else {
+                try fm.moveItem(at: tmp, to: file)
+            }
             return true
         } catch {
+            try? fm.removeItem(at: tmp)
             debugLog("ai key: save failed \(error.localizedDescription)")
             return false
         }
@@ -79,8 +85,8 @@ enum AIKey {
              kSecAttrAccount as String: "ling"]
         }
 
-        /// The old key, removed from the Keychain once read.
-        static func take() -> String? {
+        /// Reads the old key from the Keychain without deleting it until the file write succeeds.
+        static func read() -> String? {
             // Skip the Keychain entirely when there was never an item (no prompt for new users).
             var exists = query
             exists[kSecReturnAttributes as String] = true
@@ -91,8 +97,6 @@ enum AIKey {
             var out: AnyObject?
             guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
                   let key = (out as? Data).flatMap({ String(data: $0, encoding: .utf8) }), !key.isEmpty else { return nil }
-            delete()
-            debugLog("ai key: moved from the Keychain to the key file")
             return key
         }
 
@@ -210,11 +214,13 @@ final class LingClient: ObservableObject {
         ]
         do {
             _ = try await checkTransport?("chat/completions", body, key, 15)
+            guard id == keyGeneration else { return }
             keyState = .ok(seconds: Date().timeIntervalSince(started))
         } catch Failure.invalidKey {
             guard id == keyGeneration else { return }
             keyState = .invalid
         } catch Failure.rateLimited {
+            guard id == keyGeneration else { return }
             keyState = .ok(seconds: Date().timeIntervalSince(started))
         } catch {
             guard id == keyGeneration else { return }
@@ -368,6 +374,7 @@ final class LingClient: ObservableObject {
     // MARK: Transport
 
     private func post(_ path: String, body: [String: Any], key: String, timeout: TimeInterval) async throws -> [String: Any] {
+        let keyGeneration = self.keyGeneration
         var req = URLRequest(url: Self.base.appendingPathComponent(path))
         req.httpMethod = "POST"
         req.timeoutInterval = timeout
@@ -388,7 +395,7 @@ final class LingClient: ObservableObject {
         switch code {
         case 200: break
         case 401, 403:
-            if keyState != .invalid { keyState = .invalid }
+            if keyGeneration == self.keyGeneration, keyState != .invalid { keyState = .invalid }
             throw Failure.invalidKey
         case 429: throw Failure.rateLimited
         default:

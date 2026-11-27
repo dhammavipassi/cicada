@@ -379,7 +379,6 @@ final class ListenEngine {
             shown.voiceSamples = nil // the audio only travels to the meeting record
             segments.append(shown)
             // Only the last few are shown; in notes mode nothing clears them after a pause.
-            if segments.count > 30 { segments.removeFirst(segments.count - 30) }
             if segments.count > 8 { segments.removeFirst(segments.count - 8) }
             volatileTranslation = ""
             lastVolatileSent = ""
